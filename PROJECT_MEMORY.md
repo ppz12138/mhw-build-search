@@ -313,3 +313,46 @@
  20. **weapon_skills_dict 等级来源修复**：`gui_server.py:548-553` 武器技能等级改为从 `combo_skills` 取，不再错误地从 `fixed_skills` 取
  21. **detail_calc 支持 weapon_diy 参数**：`_handle_detail_calc` 新增 weapon 参数处理（激化、词条、属性修正），方案对比面板数值可跟随 weapon_diy 自定义参数变动
  22. **前端 runCompare 传递 weapon_diy**：`runCompare` 中通过 `getWeaponDIYParams()` 读取 weapon_diy 设置并传递给 `/api/detail_calc`
+
+## 2026-08-08 查询模式性能优化 & 用户技能组0方案排查
+
+### 验收标准（用户明确）
+- 技能组：耳塞2、精神抖擞3、缓冲1、快吃3、利刃3、毅力【果断】(=组合技能霸主之魂Lv3)、格挡性能3、Lv1插槽3、连击5、挑战者5、广域化5、防御3
+- **要求：1秒以内出满100方案**（参考站 mhwilds.wiki-db.com/sim 同组合0.4秒出200方案）
+
+### 关键术语澄清（用户纠正）
+- **毅力【果断】不是护石**，是 `skills_data.json` 中 `/组合技能/霸主之魂/技能名` 的显示名；查询时 combo={'霸主之魂':3}
+
+### 已完成的性能优化（fast_search_v3.py）
+1. **叶子记录优化**：`_try_fill_and_record(incremental=True)`——DFS叶子先跑 `_strict_leaf_check()`（增量状态严格可行性检查，严格度对齐 `_check_deco_feasible`），通过后才重建数据；增量维护全技能字典 `_cur_all_skills` 避免每叶子从6件装备重建
+2. **incremental 双路径**：正常叶子用增量；`_try_early_fill` 补位路径必须 `incremental=False`（临时填充不更新增量状态）
+3. **fill_slots 美化评分外提**：每轮对珠子评分一次，不再每槽位×每珠子重复
+4. **效果**：最坏基准（全树搜索）33.2s→14.3s（约2.3倍），结果一致（20方案/最高分93.5）；追加模式回归通过
+
+### 已修复的搜索bug
+- **Bug1 系列优先路径无条件return**：`_sf_bt` 枚举不完备（`_tried_ns` 每部位只试一个非系列代表件 + Top2000截断），不能无条件返回，收不满 max_results 时必须回退常规DFS补全
+- **Bug2 回退DFS丢弃快速路径结果**：新增 `_sf_keys`/`_sf_results`，`_dfs(0)` 结束后按装备指纹（name+part_idx）去重合并
+
+### ⚠️ 0方案问题排查结论（重要）
+1. **WSLOTS 默认就是 [3,3,3]**（fast_search_v3.py 第73行），武器槽不是缺省项
+2. **利刃/格挡性能是 WEAPON_SK**：`armors_cn.json` 中无任何防具含这两个技能（已验证），只能靠Lv3武器珠；利刃珠/格挡性能珠存在 +3 版本（Lv3槽）
+3. **decos_cn.json 数据已核实无误**（2026-08-08 与 gamewith 荒野装饰品图鉴逐条比对）：共361珠（weapon 295 + armor 66）。《荒野》防具珠本来就只有单档+1（防音珠【2】/浑身珠【2】/快吃珠【1】/挑战珠【3】/友爱珠【1】/防御珠【1】/连击珠【3】/缓冲珠【1】均无更高版本）；Ⅱ/Ⅲ高阶版只存在于武器珠。→ 早期“数据偏斜导致0方案”的结论是**错误的**，已推翻
+4. **实测**：武器槽3/6/8个Lv3都是0方案；插桩显示 DFS 能到达叶子（_check_deco_feasible 调用32840次）。早期“可行性检查误杀”的怀疑已部分推翻：抓到的被拒叶子多数确实无解（如某快照仅8个Lv1槽但需求8个Lv1珠+3个预留）
+5. **参考站真相**（Browser agent 实测）：mhwilds.wiki-db.com/sim 是日站 wiki-db 的 JS 模拟器；默认配置下该完整技能组也是0方案（0.015s返回）；其装饰珠数据存于用户 localStorage `mhwilds_deco` 由用户自行导入——用户看到的"0.4秒200方案"依赖其浏览器本地导入的完整珠子数据
+6. **gamewith 图鉴比对**：防音珠【2】/浑身珠【2】/早食珠【1】/挑战珠【3】/友爱珠【1】/防御珠【1】/连击珠【3】/缓冲珠【1】均只有单档Lv1效果，与我方数据一致——《荒野》防具珠本来就只有单档+1，Ⅱ/Ⅲ高阶版只存在于武器珠
+
+### 2026-08-08 晚间修复（真实bug，已修）
+**Bug：fill_slots 贪心插珠侵占预留槽位**：赤字贪心按槽位升序扫描，会把广域珠/缓冲珠等Lv1珠插进被「Lv1插槽×3」预留的槽位，导致最终预留校验失败返回 None（快照实证：缺挑战+1/连击+2、有8个Lv3空槽，本可解却被拒）。修复：fill_slots 开头把孔位技能需求（LvN插槽/分侧预留）的槽位物理隔离到 reserved_a/reserved_w，贪心/美化插珠不可触碰，最终校验与返回值重新并回；min_keep 相应只留通用预留。
+**Bug：预检查预留槽重复计数**：_check_deco_feasible/_greedy_deco_check_with_future/_strict_leaf_check 的珠子降级链检查把预留槽也计入可用容量（偏松）。修复：三处均在槽位需求验证后扣减预留槽（优先从武器侧扣，低阶槽更稀缺留给珠子），与 fill_slots 隔离方向一致。
+
+### ⏳ 未完成（下次继续）
+1. **修复后该技能组仍0方案**（库直调与真实API路径均0）。系列优先路径中996个通过预检的快照全部来自「假想最强护石」上界预检（_super_cur），真实护石组合×1901防具组合无一通过预检 → 怀疑该技能组在我方数据下真的不可行（或解空间极小）
+2. **待跑的独立暴力验证**（不依赖搜索引擎，判定数据层SAT性）：逐部位合并候选状态（技能向量截断到需求值+霸主件数+槽位计数，dict去重+剩余部位上界剪枝）→ 得到的防具状态×31去重护石，用回溯珠子求解器（武器侧_fill_weapon_slots_smart + 防具侧递归分配，含Lv1插槽×3预留）判定。若确无解→需与用户确认其浏览器里看到方案时的具体配置（武器槽/预留/护石）或数据差异；若有解→说明搜索引擎仍有剪枝误杀
+3. 系列优先路径的 _tried_ns 单代表件+Top2000截断依旧是不完备枚举（已回退常规DFS兑底，非阻塞项）
+4. 服务已用新代码重启于 http://localhost:8766；临时诊断文件已全部清理（含 _brute.py，重跑时按上述思路重写）
+`(candidates, all_skill_names, _cached_weapon_skills, armor_fixed, _cached_weapon_fixed, best_by_part, best_slot_by_part, candidates_by_part, part_series_availability)`——candidates_by_part 在索引7
+
+### 测试注意事项
+- 直接测库时 `fs.WSLOTS` 是模块级全局变量，测完要还原；gui_server 的 `_apply_weapon_slots` 按请求设置
+- Windows 控制台 GBK：诊断脚本需 `sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')`
+- 服务运行于 http://localhost:8766，代码改动后必须重启才生效
