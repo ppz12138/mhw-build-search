@@ -1545,6 +1545,19 @@ def dfs_search(charm_pool, fixed_skills, combo_skills, min_rem_armor,
         # 含需求系列技能件的候选保留（替换会破坏系列件数约束）。
         _def_dims = tuple(_i for _i in range(n_skills) if init_deficit[_i] > 0) or tuple(range(n_skills))
         if len(vec_list) > 1:
+            # 等价候选去重：需求技能贡献、分数、孔位完全相同视为等价（如攻击1需求下
+            # 大量武器 score 相同），只保留一个代表，否则互相支配会把等价候选全删
+            # （416 武器 -> 0），导致"自适应武器"需求被误判无解。
+            _seen_eq = set()
+            _dedup = []
+            for _v in vec_list:
+                _eqkey = (tuple(_v['sv'][_i] for _i in _def_dims), _v['score'],
+                          _v.get('slots_sorted'), _v.get('wslots_sorted'))
+                if _eqkey in _seen_eq:
+                    continue
+                _seen_eq.add(_eqkey)
+                _dedup.append(_v)
+            vec_list = _dedup
             _survivors = []
             _has_slot = (pi in (0, 1, 2, 3, 4, 5))  # 防具5部位+护石
             for _b in vec_list:

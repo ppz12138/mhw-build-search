@@ -619,10 +619,13 @@ class SearchHandler(BaseHTTPRequestHandler):
         with _lock:
             try:
                 # 统一搜索：武器作为第7个部位平权参与，不再有独立搜索路径
+                # auto_weapon=True（自动匹配武器）时不传 user_weapon_skills（None），
+                # 让后端自动匹配带系列技能的武器；否则（用户固定武器系列）传实际武器技能。
+                user_weapon_skills = None if (auto_weapon and not weapon_actual_skills) else weapon_actual_skills
                 raw_results = fs.dfs_search(
                     fs.charm_pool, fixed_skills, search_combo, min_rem_armor,
                     max_results=max_results, timeout_s=timeout_s, quiet=False,
-                    min_rem_weapon=min_rem_weapon, user_weapon_skills=weapon_actual_skills
+                    min_rem_weapon=min_rem_weapon, user_weapon_skills=user_weapon_skills
                 )
             except Exception as e:
                 fs.WSLOTS = orig_wslots
