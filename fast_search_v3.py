@@ -2735,6 +2735,7 @@ def dfs_search(charm_pool, fixed_skills, combo_skills, min_rem_armor,
             # 网页版量纲统一为加权分：左边 Q['score']/remaining_best_sum 已含 SKILL_WEIGHT，
             # 孔位价值同样按加权折算（每孔至少可装1点技能珠，故 ×SKILL_WEIGHT），
             # 右边 cur_def_score（未加权技能点赤字）×SKILL_WEIGHT 对齐，避免量纲错配。
+            # 用含孔位的 score×剩余数作为上界（网页版 Q.i*L），结合 remaining_best_sum 安全不误剪。
             q_score = Q['score']
             remaining_after = remaining_best_sum[depth + 1] if depth < 6 else 0
             # 网页版 Q.i*L 剪枝：剩余未放置部位数（5防具+护石，武器单独处理）
