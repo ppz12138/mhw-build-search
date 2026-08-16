@@ -353,3 +353,163 @@
 `_diag_nosol*.py`（无解场景）、`_diag_brk_sol.py`（有解 break 诊断）、`_diag_d6trace.py`（depth6 追踪）、`_diag_prof.py`（cProfile）、`_diag_equiv.py`、`_bench_full2.py`/`_bench_layers2.py`（基准）、`_verify_set2.py`（有解回归）、`_diag_nosol16.py`（无解B depth 分布）。
 - 已清理：DIAG0 3 方案对比调试块（2026-08-14 修复完成后移除）
 - 残留：fast_search_v3.py 中 `_DIAG`/`_TRACE`/`_DIAG_DEPTH` 守卫的调试打印（默认 False，供诊断脚本使用），提交前可清理
+
+## 追加模式性能优化（2026-08-15 已完成，18 倍提速）
+
+**语义**（用户澄清）：追加模式 = 在给定技能组基础上，求每个其他技能可追加到的**等级上限**（允许重新配装）。例：只选"挑战者5"时所有技能追加上限=满级。
+
+**优化前**：崩溃（`_quick_skill_cache_tl` 未定义 NameError）→ 修复后 42s（137 技能逐个 DFS，每技能 0.3-3.9s）。
+
+### 性能瓶颈定位（cProfile）
+- 慢的不是不可达技能（`_slot_based_upper`/`_quick_skill_upper_bound` 已预判跳过），而是**组合技能（NO_DECO_SK，如前辈之指引/皮革制品之柔韧/甲虫之直觉）**的可行性搜索被 `_expand_variants` 拖垮。
+- 根因：`_try_fill_and_record` 记录每个可行叶子都调用 `_expand_variants`（展开 α/β 变体，每个变体做昂贵 `fill_slots`），追加模式 `max_results=1` 只需首解，但展开仍穷举数万变体 → Lv3 组合技能搜索 60s+（cProfile：62720 次 fill_slots 占 99% 时间）。
+
+### 三项优化（fast_search_v3.py）
+1. **`_FEASIBILITY_ONLY` 跳过 `_expand_variants`**（~2193）：追加/孔位可行性搜索只关心"是否存在解"，不展开变体 → Lv3 组合技能 60s+ → 0.01s。**普通搜索（`_FEASIBILITY_ONLY=False`）不受影响，α/β 变体展开照常**（回归验证 243 解含铺鳞/叠鳞变体）。
+2. **复用 `cached_ctx` 作候选池**（`_run_skill_job` extra 分支）：原注释"cached_ctx 支配剪枝会误剪目标技能"已过时——cached_ctx 构建时 `extra_skill_names=_extra_sn` 已含全部追加技能，`protection_skills` 会保护所有提供追加技能的防具（实测 19/19 与单技能池一致）。省掉 140 次 `_build_candidates`。
+3. **上界优先 + 二分**（`_run_skill_job` extra 分支）：技能需求单调，先测理论上界 `start_lv`（`_quick_skill_upper_bound` 不低估故安全），可达则 1 次 DFS 命中；不可达再二分 `[blv, start_lv-1]`（O(log) 次）。替代逐级升序（cap 次）。
+4. **`_quick_skill_cache_tl = threading.local()` 提升到模块级**：修复 `_qs_cache` 的 NameError 崩溃。
+
+### 实测性能（宽松"挑战者5" 140 技能）
+| 阶段 | 耗时 |
+|------|------|
+| 崩溃修复后 | 42s |
+| +跳过展开变体 | 4.75s |
+| +复用 cached_ctx | ~4.75s |
+| +二分 | 3.5s |
+| +上界优先 | **2.29s** |
+| 固定武器场景 | **2.05s** |
+
+### 正确性
+- 宽松场景 140 技能结果与优化前一致（6 个 Lv0 不可达：刚刃打磨/属性变换/属性吸收/属性异常耐性/指示随从/毛皮之诱惑，其余全满级）。
+- 普通搜索 30 解/变体展开回归通过（`_FEASIBILITY_ONLY` 仅追加模式置 True，`query_extra_stream` 内设、finally/末尾恢复）。
+- 固定武器（user_weapon_skills）场景正常，无崩溃无超时。
+
+## 追加模式"有解基线但追加全无解"场景（2026-08-16 修复正确性 + 性能 241→110s）
+
+**场景**：极限方案（12 固定技能 + 霸主之魂3 + 黑蚀龙之力2）基线有解（30解），但几乎所有追加技能都不可达（137 技能中仅 35-37 可达，其余需穷举证明无解）。
+
+### 两个关键 bug/认知（勿再走错路）
+1. **单技能窄池对 NO_DECO_SK（件数型）漏解**：`_build_candidates` 无 `protect_no_deco` 时，支配过滤会剪掉件数组合所需防具（如叠鳞之工艺被误判 Lv0，实际 Lv1 可达）。**必须 `protect_no_deco=True`**（保护所有 NO_DECO_SK 防具）。普通技能（靠珠子）无需 protect，候选 ~530 最快；NO_DECO_SK 必须 protect，候选 ~756。
+2. **二分下界 best 未初始化**：上界不可达进入二分时，若二分路径全不可达，`best` 保持 blv 而丢失 blv+1（已确认可达）。**进入二分前必须 `best = blv + 1`**（下界已由 probe 确认可达）。
+
+### 性能特征（极限场景 137 技能，总 110s）
+| 技能类型 | 单次无解证明 | 候选数 |
+|---------|-------------|--------|
+| 普通技能（看破/攻击/匠） | 0.3-1s | ~530（无 protect） |
+| NO_DECO_SK 件数型（护龙之脉动/叠鳞/系列之力） | 2-5s | ~756（protect_no_deco） |
+- 慢的根因：NO_DECO_SK 无珠子维度，需求靠件数满足，`remaining_series_max` 件数剪枝存在但件数充足时组合约束（12 固定技能）导致 DFS 探索 1-3 万节点。
+- **cached_ctx 宽保护池（1175 候选）对不可达证明比单技能窄池慢 4-8 倍**（不可达穷举时宽池搜索树大），因此追加探测统一用单技能池+protect。
+- 流程：先测最小追加等级 blv+1（单技能池，不可达即止，避免二分多次穷举）；可达再二分找最高。
+
+### 验证
+- 叠鳞之工艺 Lv1/3、毛皮之诱惑 Lv1/3（修复前误判 Lv0）、护龙之脉动 Lv0/3、威吓 Lv1/1 正确。
+- 宽松场景（挑战者5）全满级正确（5.5s）。
+- 普通搜索（_verify_set2.py）无回归（结果数=1 全满足 ✓）。
+
+## 网页版算法真相（2026-08-16 深入逆向分析，修正此前的认知）
+
+**结论：网页版评分剪枝是安全上界剪枝，从不漏解（用户实证）。之前"网页版有误剪风险"的说法是我理解错误，已纠正。**
+
+### 网页版核心搜索 tf.prototype.nb（docs/source/sim-compiled-ja.js 545-554）
+- **评分剪枝**：`D.P.f * Pa + M < A` → 剪枝
+  - `D.P.f` = **当前候选评分 = ie(候选提供的需求技能加权和) + 槽位数**（不是裸槽位！含 NO_DECO 套装技能权重 100）
+  - `Pa` = 剩余可放防具部位数（0-5）
+  - `M` = 已放装备孔位容量（`Ud`）
+  - `A` = 剩余需求加权分（`wf` = Σ `ge(技能,剩余点数)`，`ge` 权重 = `he[技能]||100`）
+  - **语义**：`D.P.f*Pa` = "剩余 Pa 个部位全放这个最佳候选"能提供的最大评分，是**严格安全上界**（候选按评分降序，剩余候选 ≤ 当前）。包含套装技能权重 → 不会误剪"靠剩余防具点数满足套装技能"的分支。
+- **候选构建 g.ub**：提供需求技能的防具**单独保留**；不提供的按"部位+槽位组"聚合（`d` 函数按槽位数组 join 分组 + `xd` 取 max + `Pd`/`Vd` 支配过滤）。→ **网页版每部位候选仅 3-8 个**。
+- **支配判定 Vd**：候选 b 被 c 支配当：槽位 c 不更少、同部位、孔位 c 不更小、每个需求技能 c 的贡献 ≥ b。
+
+### 关键认知修正（勿再走错路）
+1. **我们 Python 版已有等价评分剪枝**（fast_search_v3.py ~2778）：`q_score * _remaining_part_count + cur_slot_total * SKILL_WEIGHT < _gear_def_pts * SKILL_WEIGHT`，`SKILL_WEIGHT=100`，`q_score` 含技能点×100。量纲已对齐，剪枝方向正确。
+2. **我们慢的真正差距 = 候选数量**：护龙之脉动场景每部位 38 候选（总 757），DFS 探索 38^5 级空间证明无解；网页版每部位 3-8 个（因候选聚合），剪枝能快速判死。
+3. **对齐核心 = 复刻候选聚合**（不提供需求技能的防具按"部位+槽位组"聚合成代表），不是纠结剪枝。
+
+## 追加模式 NO_DECO 评分剪枝突破（2026-08-16 极限 90s→34.84s）
+
+**关键洞察**：网页版 `wf`/`vf` 把 NO_DECO 套装技能的件数需求当技能点（`ge` 权重 100）纳入评分 `A`。而 Python 版 `cur_def_score` 只含普通技能赤字（NO_DECO 被排除在 tracked_skills 外），导致评分剪枝 `q_score*remaining+slot < gear_def` 看不到护龙/叠鳞等件数需求，只能靠叶子件数穷举判无解（护龙 Lv1 2.7s）。
+
+**修复**（fast_search_v3.py ~2790）：把剩余 NO_DECO 件数需求 `Σ(need-have-wprov)` 加入 `_gear_def_pts`（每件权重=SKILL_WEIGHT=100），量纲对齐网页版 A。效果：
+- 护龙之脉动 Lv1 不可达：2.7s → 0.33s
+- 叠鳞之工艺 Lv2 不可达：1.62s → 0.09s
+- 极限场景总耗时：90s → **34.84s**，正确性全保持（叠鳞 Lv1/3、护龙 Lv0/3、毛皮 Lv0/3、宽松全满级、普通搜索无回归）
+- 普通技能（攻击/匠/看破）：0.5-1s → 0.13-0.49s
+
+**注意**：评分剪枝上界 `q_score=当前候选score`（候选按 score 降序，提供 NO_DECO 的防具含其×100 排前），加入件数后剪枝安全不误剪（实测叠鳞 Lv1 仍可达 True，未误剪毛皮/护龙等不可达场景）。
+
+### 剩余瓶颈（34.84s vs 网页版 4s）
+- NO_DECO 件数型技能（叠鳞 Lv1 可达 0.82s、毛皮 Lv0 不可达 0.64s）单次 DFS 仍 0.3-0.8s：需凑 N 件套装+12 固定技能，DFS 探索 5000+ 节点、1000+ 次 fill_slots 才确认/找到首解。
+- **fill_slots 热分析**（叠鳞 Lv1 cProfile）：1086 次 fill_slots 里 **1085 次失败仅 1 次成功**（首解很晚出现）；fill_slots 0.841s 中 **`_fill_weapon_slots_smart`（武器槽插珠）占 0.759s（90%）**。
+- **`_check_deco_feasible` 大量假可行**（通过 1086 次但 fill_slots 仅 1 次成功），故**不能**用它替代 fill_slots（会大量虚报可达）。
+- 网页版每技能 ~0.03s 靠 `si` 珠子分层搜索（只遍历带珠子的防具 + `ti` 珠子预判）+ 候选排序让首解早出现。
+- 候选仍多（每部位 53-64）：网页版"提供需求技能的防具单独保留"我也复现了，但网页版靠珠子分层缩小实际搜索的候选。
+- 待尝试方向：①候选排序让"提供目标 NO_DECO + 固定技能"防具优先（首解更早，减少 fill_slots 失败次数）；②`_FEASIBILITY_ONLY` 下简化 `_fill_weapon_slots_smart`（可行性搜索只判武器技能能否补足，不完整构造）；③仿网页版 `si` 珠子分层搜索重构（大工程）。
+
+## 根本性提速：多进程并行方案（2026-08-16 分析，待实施）
+
+**背景**：极限场景已 90s→34.67s（等价合并 + NO_DECO 评分剪枝，正确性全保证）。但网页版 4s，差 8 倍。
+
+**根因**：网页版快的本质 = ①`si` 珠子分层搜索（普通技能先珠子预判再防具搜）②100ms 超时兜底（`wi` 每技能超时即标不可达）③**Python 解释器 vs JS JIT 的语言差距（5-10 倍）**。即使算法完美对齐，单进程 Python 也难到 4s。
+
+**结论**：根本性提速必须**多进程并行**（利用多核弥补 Python 慢）。137 个技能搜索相互独立（都基于同一 fixed_skills/cached_ctx），天然可并行。8 进程预估 34.67s→~5-6s，接近网页版。
+
+**方案**：
+1. 把 `_run_skill_job`（嵌套闭包，3466-3721，依赖 fixed_skills/combo_skills/cached_ctx/baseline_skills/min_rem_armor_weapon/user_weapon_skills/series_*/超时等 15+ 变量）提取为**模块级 `_run_single_skill(ctx, job)`**，参数化所有闭包依赖。
+2. worker 进程 `initializer`：`_FEASIBILITY_ONLY=True` + 重新构建 cached_ctx（每进程一次）+ 加载数据（0.12s 已测）。
+3. 主进程 `multiprocessing.Pool.imap_unordered` 分发 `jobs`（upgrade+extra），流式收集进度 yield。
+4. Windows spawn：模块级函数 + `if __name__=='__main__'` 保护；全局缓存（`_fw_cache`/`_qs_cache`）每进程隔离（已是 threading.local，spawn 天然隔离）。
+
+**风险**：①嵌套函数提取为模块级易漂移；②worker 进程 cached_ctx 构建需与主进程一致（extra_skill_names 需含全部追加技能，否则支配剪枝漏保护）；③进度顺序（`imap_unordered` 需按 done 重排）；④正确性回归需充分验证。
+
+**当前单进程瓶颈**（供后续单进程优化参考）：NO_DECO 件数型技能 0.2-0.8s/个（叠鳞Lv1可达0.87s、护龙Lv0 0.33s、毛皮Lv0 0.62s），叠鳞Lv1 = 5345 DFS节点 + 1086 fill_slots（1085失败仅1成功），fill_slots 中 `_fill_weapon_slots_smart` 武器槽枚举占 90%。`_check_deco_feasible` 大量假可行（1086通过/1成功），不能替代 fill_slots。
+
+## 追加模式多进程并行（2026-08-16 已实施，极限 90s→14.08s，正确性全保证）
+
+**背景**：单进程 Python 算法优化已达 34.67s（等价合并+NO_DECO评分剪枝），但 Python 解释器 vs JS JIT 的固有差距使其难到网页版 4s。137 个技能搜索相互独立，用**多进程利用多核**根本提速。
+
+**重构（fast_search_v3.py 末尾 369 行新增）**：
+1. **`_run_single_skill(ctx, job)`** 模块级函数：把 `_run_skill_job`（嵌套闭包 256 行、20+ 闭包变量）提取为模块级，ctx 承载全部可序列化上下文（fixed_skills/combo_skills/baseline_skills/min_rem/series_*/超时/基线上界）。等价 `_slot_based_upper_impl`。
+2. **`_get_extra_cached_ctx(ctx)`**：worker 进程按 ctx 重建 cached_ctx（每进程一次，`_extra_cached_ctx_cache` threading.local 缓存，key=固定技能+combo）。全局数据（charm_pool/parts/deco_idx）worker import 模块自动加载。
+3. **`_run_single_job_worker(payload)`**：spawn worker 入口，`_FEASIBILITY_ONLY=True`，调 `_run_single_skill`。
+4. **`_dispatch_extra_jobs(ctx, jobs)`**：`Pool.imap_unordered(..., chunksize=1)` 每 job 独立分发（负载均衡），流式收集；异常回退顺序。
+5. **`EXTRA_PARALLEL_WORKERS`** 全局开关（默认 0=顺序）；gui_server 调用前按 `min(cpu_count,8)` 设置。
+
+**实测**：
+- 顺序 34.67s → 多进程 4/8 workers = 14.75/14.08s（极限场景，8 进程 2.5 倍）
+- 宽松 4.28s → 2.44s
+- 正确性：4/8 进程与顺序完全一致（叠鳞 Lv1/3、护龙 Lv0/3、毛皮 Lv0/3、威吓 Lv1/1、无我 Lv3/3）
+
+**剩余瓶颈（14s vs 网页版 4s）**：慢技能的单次不可达证明（0.1-0.7s，叠鳞Lv1可达0.69s、毛皮Lv0 0.63s、雷属性0.36s、护龙0.34s、攻击/匠0.23s）。多进程已并行，但慢技能总和（约15-20个×0.5s）限制了 8 workers 的并行收益（负载不均，8 worker 仅 2.5 倍而非 8 倍）。**真正提速慢技能需算法优化**（减少 fill_slots 1085 次失败/武器槽枚举，或更强中间剪枝，均有漏解风险，谨慎）。
+
+## 尚未对齐的点（追加模式，人话清单）
+
+### 已对齐 ✅
+- 单调二分/上界优先搜索逻辑（逐档位存在性，出解即停）
+- 评分上界剪枝公式（`q_score*剩余部位+孔位 < 需求`，量纲对齐网页版 `D.P.f*Pa+M<A`）
+- `_FEASIBILITY_ONLY` 跳过变体展开/early_fill（追加只求首解）
+- 单技能窄池 + protect_no_deco（NO_DECO 不漏解，叠鳞 Lv1 正确）
+
+### 未对齐 ❌（按重要性排序）
+1. **候选聚合缺失（最大差距，导致 110s vs 0.2s）**：网页版把"不提供需求技能的防具"按部位+槽位组聚合成代表，每部位仅 3-8 候选；我们保留所有有孔位/技能防具，每部位 38 个 → 搜索树大、不可达证明慢（NO_DECO 技能 2-5s/个，总 110s）。
+2. **无超时兜底**：网页版每档位 100ms 超时即标不可达（`pi` 机制），避免无限穷举；我们 `_to_dfs` 按候选数设 1s，仍会穷举到底。
+3. **护石层判死弱**：网页版 `si` 对普通技能有珠子预判（`ti`/`wh` 孔位-珠子可行性上界），我们 `_greedy_deco_check_with_future` 有但强度不足（NO_DECO 无珠子时不参与）。
+
+## 修复计划（对齐网页版追加模式，目标 0.5s 内）
+
+### 阶段1：候选聚合（核心，先做）
+- 在 `_build_candidates` 里复刻网页版 `g.ub`：把**不提供任何需求技能（含追加目标技能）的防具**按"部位+槽位组"聚合成代表（保留最大孔位价值），提供需求技能的防具**单独保留**（保证不漏解）。
+- 安全边界：聚合只对"无需求技能贡献"的防具做；NO_DECO 场景用 protect_no_deco 保护；追加搜索时目标技能必须进需求集。
+- 验证：护龙之脉动场景每部位候选应从 38 → 3-8，不可达证明 2-5s → 0.05s 级。
+
+### 阶段2：超时兜底（对齐网页版 pi）
+- 追加模式每个档位给短超时（如 100-200ms），超时未找到解 → 标记不可达（标 Lv0）。
+- 配合候选聚合后搜索本身极快，短超时很少误伤可达技能。
+
+### 阶段3：护石层判死强化（如仍慢再优化）
+- 强化 `_greedy_deco_check_with_future` 对普通技能的珠子-孔位可行性上界（对齐网页版 `si` 的 `ti`/`wh`）。
+
+### 验收标准
+- 极限方案（12 技能+2 系列）追加总耗时 ≤ 1s（当前 110s）
+- 宽松场景 ≤ 1s
+- 正确性：叠鳞 Lv1/3、护龙之脉动 Lv0/3、普通搜索 30 解不漏解，全部回归通过

@@ -531,11 +531,17 @@ class SearchHandler(BaseHTTPRequestHandler):
         # 追加查询与查询方案保持同一假设，避免"查询无解但追加误报有空间"的矛盾。
         weapon_series = params.get('weapon_series_skill', '')
         weapon_combo = params.get('weapon_combo_skill', '')
-        user_weapon_skills = {}
+        # 与普通搜索一致：武器实际带的技能（用于搜索）
+        weapon_actual_skills = {}
         if weapon_series and weapon_series in fs.NO_DECO_SK:
-            user_weapon_skills[weapon_series] = 1
+            weapon_actual_skills[weapon_series] = 1
         if weapon_combo and weapon_combo in fs.NO_DECO_SK:
-            user_weapon_skills[weapon_combo] = 1
+            weapon_actual_skills[weapon_combo] = 1
+        # auto_weapon=True（自动匹配武器，武器留空）时不传 user_weapon_skills（None），
+        # 让后端自动匹配带 combo 系列技能的武器（保持与查询方案一致），
+        # 否则传空 dict {} 会导致 combo 的系列技能无武器提供、基线无解、追加报无解。
+        auto_weapon = params.get('auto_weapon_skill', True)
+        user_weapon_skills = None if (auto_weapon and not weapon_actual_skills) else weapon_actual_skills
 
         orig_wslots = self._apply_weapon_slots(params)
         t0 = time.time()
@@ -558,6 +564,15 @@ class SearchHandler(BaseHTTPRequestHandler):
 
         with _lock:
             try:
+                # 追加模式多进程并行：按 CPU 核数启用 worker，利用多核弥补 Python 慢。
+                # 全局开关可被外部覆盖；默认 min(cpu_count, 8)（避免 spawn 开销过大的极端核数）。
+                try:
+                    import multiprocessing as _mpc
+                    _default_workers = max(1, min(_mpc.cpu_count() or 2, 8))
+                except Exception:
+                    _default_workers = 2
+                if getattr(fs, 'EXTRA_PARALLEL_WORKERS', 0) == 0:
+                    fs.EXTRA_PARALLEL_WORKERS = _default_workers
                 for chunk in fs.query_extra_stream(
                     fixed_skills, combo_skills, min_rem_armor, fs.charm_pool,
                     mode=mode, fav_skills=fav_skills, dis_skills=dis_skills,
