@@ -3426,13 +3426,22 @@ def query_extra_stream(fixed_skills, combo_skills, min_rem_armor, charm_pool, mo
         return total
     slot_max_actual = {'armor': {'Lv1': 0, 'Lv2': 0, 'Lv3': 0},
                        'weapon': {'Lv1': 0, 'Lv2': 0, 'Lv3': 0}}
-    # 计算时剔除已存在的组合式孔位技能（如 BASE_FIXED_MIN 的 Lv1插槽），
-    # 使上限表示"该侧该等级总共可保留的最大数"，与面板"当前→最大"的显示一致。
-    _base_for_slot = {k: v for k, v in fixed_skills.items()
-                      if not (k.startswith('Lv') and k.endswith('插槽'))}
+    # 用户技能组已有的插槽需求：通用 Lv{sl}插槽（防具+武器）归到防具侧，
+    # 与孔位面板"当前→最大"的显示对齐（用户主要用通用插槽预留防具孔）。
+    # 武器侧只计 武器Lv{sl}插槽（不含通用，避免重复计数）。
+    _user_slots = {'armor': {}, 'weapon': {}}
+    for _sl in (1, 2, 3):
+        _user_slots['armor'][_sl] = (fixed_skills.get(f'防具Lv{_sl}插槽', 0)
+                                     + fixed_skills.get(f'Lv{_sl}插槽', 0))
+        _user_slots['weapon'][_sl] = fixed_skills.get(f'武器Lv{_sl}插槽', 0)
+    # 基础 = 完整固定技能组（保留所有插槽约束，含用户 Lv1插槽×3 等），
+    # 测某等级时只移除该等级的已有插槽，保留其他等级约束（如 Lv1插槽×3 会一直生效），
+    # 这样各等级上限基于完整技能组计算（修复误报"防具Lv2最大1"：必须保留 Lv1 孔时 Lv2 配不出）。
+    _base_for_slot = dict(fixed_skills)
     for _side, _prefix in (('armor', '防具Lv'), ('weapon', '武器Lv')):
         _prev_max = None
         for _sl in (1, 2, 3):
+            _cur = _user_slots[_side][_sl]
             # 用户规格：预留孔位上限为6，二分上界封顶6即可（同时减少搜索次数）
             _hi = min(_side_slot_bound(_side, _sl), 6)
             if _prev_max is not None:
@@ -3440,8 +3449,13 @@ def query_extra_stream(fixed_skills, combo_skills, min_rem_armor, charm_pool, mo
             _lo, _best = 0, 0
             while _lo <= _hi:
                 _mid = (_lo + _hi) // 2
-                _tfix = dict(_base_for_slot)
-                _tfix[f'{_prefix}{_sl}插槽'] = _mid
+                # 只移除当前等级的已有插槽（防具Lv{sl}插槽/通用Lv{sl}插槽/武器Lv{sl}插槽），
+                # 保留其他等级的插槽约束；当前等级设为 用户已有 + 额外追加。
+                _tfix = {k: v for k, v in _base_for_slot.items()
+                         if not (k == f'{_prefix}{_sl}插槽'
+                                 or k == f'Lv{_sl}插槽'
+                                 or k == f'武器Lv{_sl}插槽')}
+                _tfix[f'{_prefix}{_sl}插槽'] = _cur + _mid
                 _res = dfs_search(charm_pool, _tfix, combo_skills, min_rem_armor,
                                   max_results=1, quiet=True, timeout_s=dfs_timeout, cached_ctx=cached_ctx,
                                   min_rem_weapon=min_rem_weapon)
@@ -3450,12 +3464,13 @@ def query_extra_stream(fixed_skills, combo_skills, min_rem_armor, charm_pool, mo
                     _lo = _mid + 1
                 else:
                     _hi = _mid - 1
-            slot_max_actual[_side][f'Lv{_sl}'] = _best
-            _prev_max = _best
+            _total = _cur + _best
+            slot_max_actual[_side][f'Lv{_sl}'] = _total
+            _prev_max = _total
             _done += 1
-            print(f"  [孔位] {_prefix}{_sl} 可保留最大 {_best} 个 [{_done}/{total}]")
+            print(f"  [孔位] {_prefix}{_sl} 可保留最大 {_total} 个(含已有{_cur}) [{_done}/{total}]")
             yield {'type': 'progress', 'done': _done, 'total': total,
-                   'skill': f'{_prefix}{_sl}插槽', 'lv': _best, 'cap': 6,
+                   'skill': f'{_prefix}{_sl}插槽', 'lv': _total, 'cap': 6,
                    'delta': 0, 'tag': 'slot', 'wcr': 0}
 
     # === 未满级固定技能升级 + 追加技能：顺序扫描 ===
@@ -3746,9 +3761,9 @@ def query_extra_stream(fixed_skills, combo_skills, min_rem_armor, charm_pool, mo
             dfs_timeout, series_timeout,
             _base_skill_from_gear, _base_deco_slots, _base_deco_wslots,
             final_output, under_max)
-        _disp_results, _disp_prog = _dispatch_extra_jobs(_ctx, jobs)
-        for _j in range(len(jobs)):
-            _sm, _prog, _log = _disp_results[_j]
+        # 流式消费：_dispatch_extra_jobs 每完成一个 job 就 yield，边收边转发进度，
+        # 保证追加技能阶段进度条实时更新（而非阻塞等全部完成再一次性返回）。
+        for _j, _sm, _prog, _log in _dispatch_extra_jobs(_ctx, jobs):
             skill_max[jobs[_j][1]] = _sm
             _done += 1
             _prog['done'] = _done
@@ -4182,29 +4197,25 @@ EXTRA_PARALLEL_WORKERS = 0
 
 
 def _dispatch_extra_jobs(ctx, jobs):
-    """分发技能 job（多进程或顺序），返回 (结果dict, 进度列表)。"""
-    results = {}
-    prog_list = []
+    """分发技能 job（多进程或顺序），作为生成器流式 yield (job_index, _sm, _prog, _log)。
+    多进程用 imap_unordered 每完成一个即 yield（实时进度），而不是阻塞等全部完成再返回，
+    否则追加技能阶段进度条不实时更新（看起来只有孔位搜索有进度条）。"""
     n = len(jobs)
     if EXTRA_PARALLEL_WORKERS > 1 and n >= 4:
         try:
             import multiprocessing as _mp
             _mp_context = _mp.get_context('spawn')
-            # 每个 job 独立提交（imap_unordered），worker 空闲即接下一个，天然负载均衡。
             _all_jobs = [(j, jobs[j]) for j in range(n)]
             with _mp_context.Pool(EXTRA_PARALLEL_WORKERS) as pool:
                 for job_index, _sm, _prog, _log in pool.imap_unordered(
                         _run_single_job_worker, [(ctx, jt) for jt in _all_jobs],
                         chunksize=1):
-                    results[job_index] = (_sm, _prog, _log)
-                    prog_list.append((job_index, _prog))
-            return results, prog_list
+                    yield job_index, _sm, _prog, _log
+            return
         except Exception:
             # 回退顺序
             pass
     for j in range(n):
         _sm, _prog, _log = _run_single_skill(ctx, jobs[j])
-        results[j] = (_sm, _prog, _log)
-        prog_list.append((j, _prog))
-    return results, prog_list
+        yield j, _sm, _prog, _log
 
