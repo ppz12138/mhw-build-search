@@ -290,6 +290,10 @@ input:focus, select:focus { outline: none; border-color: var(--accent); box-shad
   box-shadow: 0 2px 10px rgba(108,140,255,0.12);
 }
 .ls-label { font-size: 12px; color: var(--muted); margin-right: 4px; }
+/* 局部展开等级选择器的包裹层：独占一行，与 .level-selector 换行一致 */
+.lvsel-wrap { flex-basis: 100%; width: 100%; }
+/* 局部展开等级选择器的包裹层：独占一行，与 .level-selector 换行一致 */
+.lvsel-wrap { flex-basis: 100%; width: 100%; }
 .lv-btn {
   min-width: 30px; height: 30px;
   padding: 0 10px;
@@ -412,6 +416,9 @@ input:focus, select:focus { outline: none; border-color: var(--accent); box-shad
   margin-bottom: 16px;
   box-shadow: var(--shadow);
   transition: box-shadow 0.25s ease, transform 0.2s ease, border-color 0.25s ease;
+  /* 离屏结果跳过渲染：100 方案数万 DOM 时，大幅降低内存/样式计算占用（纯 CSS，不改交互显示） */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 300px;
 }
 .result-card:hover { box-shadow: var(--shadow-lg); border-color: var(--accent); transform: translateY(-1px); }
 .result-head {
@@ -996,41 +1003,6 @@ hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
   <div class="card">
     <div class="card-title">技能选择 <span class="sub">点击技能展开等级选择，⭐收藏置顶</span></div>
     <div id="skill-selection"></div>
-    <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
-      <div style="font-size:13px;font-weight:600;color:var(--accent);margin-bottom:10px;">预留孔位</div>
-      <div style="display:flex;flex-wrap:wrap;gap:16px;">
-        <div style="display:flex;align-items:center;gap:8px;">
-          <span style="font-size:13px;color:var(--muted);font-weight:500;">防具孔</span>
-          <div style="display:flex;gap:4px;">
-            <select id="res-armor-lv1" onchange="updateReserveSlots()" style="width:52px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 2px;font-size:13px;text-align:center;">
-              <option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option>
-            </select>
-            <select id="res-armor-lv2" onchange="updateReserveSlots()" style="width:52px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 2px;font-size:13px;text-align:center;">
-              <option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option>
-            </select>
-            <select id="res-armor-lv3" onchange="updateReserveSlots()" style="width:52px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 2px;font-size:13px;text-align:center;">
-              <option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option>
-            </select>
-          </div>
-          <span style="font-size:12px;color:var(--muted);">Lv1 / Lv2 / Lv3</span>
-        </div>
-        <div style="display:flex;align-items:center;gap:8px;">
-          <span style="font-size:13px;color:var(--muted);font-weight:500;">武器孔</span>
-          <div style="display:flex;gap:4px;">
-            <select id="res-weapon-lv1" onchange="updateReserveSlots()" style="width:52px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 2px;font-size:13px;text-align:center;">
-              <option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option>
-            </select>
-            <select id="res-weapon-lv2" onchange="updateReserveSlots()" style="width:52px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 2px;font-size:13px;text-align:center;">
-              <option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option>
-            </select>
-            <select id="res-weapon-lv3" onchange="updateReserveSlots()" style="width:52px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px 2px;font-size:13px;text-align:center;">
-              <option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option>
-            </select>
-          </div>
-          <span style="font-size:12px;color:var(--muted);">Lv1 / Lv2 / Lv3</span>
-        </div>
-      </div>
-    </div>
   </div>
 
   <!-- 已选技能区 -->
@@ -1264,41 +1236,18 @@ async function init() {
   updateSavedCount();
 }
 
-function initReserveSlots() {
-  const levels = [1, 2, 3];
-  for (const lv of levels) {
-    for (const type of ['armor', 'weapon']) {
-      const sel = document.getElementById('res-' + type + '-lv' + lv);
-      if (!sel) continue;
-      let html = '';
-      for (let i = 0; i <= 6; i++) {
-        html += '<option value="' + i + '">' + i + '</option>';
-      }
-      sel.innerHTML = html;
-    }
-  }
-}
-
 function getReserveSlots() {
-  const armorTotal = [1,2,3].reduce((s, lv) => s + parseInt(document.getElementById('res-armor-lv' + lv)?.value || '0'), 0);
-  const weaponTotal = [1,2,3].reduce((s, lv) => s + parseInt(document.getElementById('res-weapon-lv' + lv)?.value || '0'), 0);
+  const armorTotal = [1,2,3].reduce((s, lv) => s + (armorReserve[lv] || 0), 0);
+  const weaponTotal = [1,2,3].reduce((s, lv) => s + (weaponReserve[lv] || 0), 0);
   return { armorTotal, weaponTotal };
 }
 
 function updateReserveSlots() {
-  for (const lv of [1, 2, 3]) {
-    const aVal = parseInt(document.getElementById('res-armor-lv' + lv)?.value || '0');
-    const wVal = parseInt(document.getElementById('res-weapon-lv' + lv)?.value || '0');
-    armorReserve[lv] = aVal;
-    weaponReserve[lv] = wVal;
-  }
+  // 预留孔位由"孔位追加"面板（setReserveSlot）维护状态，此处仅刷新面板
   if (extraQueryResult) renderExtraSkills();
 }
 
 function clearReserveSlot(type, lv) {
-  // 必须先重置下拉框再同步状态，否则 updateReserveSlots 会从下拉框读回旧值
-  const sel = document.getElementById('res-' + type + '-lv' + lv);
-  if (sel) sel.value = '0';
   if (type === 'armor') armorReserve[lv] = 0;
   else weaponReserve[lv] = 0;
   updateReserveSlots();
@@ -1544,7 +1493,7 @@ function renderSkillSelection() {
     sorted.forEach(s => {
       html += renderSkillButton(s, 'select');
       if (expandedSkill && expandedSkill.context === 'select' && expandedSkill.skill === s) {
-        html += renderLevelSelector(s, 'select', selectedSkills[s] || 0);
+        html += '<div class="lvsel-wrap">' + renderLevelSelector(s, 'select', selectedSkills[s] || 0) + '</div>';
       }
     });
     html += '</div></div>';
@@ -1560,7 +1509,7 @@ function renderSkillButton(skill, context) {
   const isCombo = COMBO_SKILLS.includes(skill);
   const isSeriesCombo = isSeries || isCombo;
   if (isSeriesCombo) {
-    return '<button class="skill-btn ' + (selected?'selected':'') + '" onclick="toggleSkillExpand(\'' + context + '\',\'' + esc(skill) + '\')">' +
+    return '<button class="skill-btn ' + (selected?'selected':'') + '" data-skill="' + esc(skill) + '" data-ctx="' + context + '" onclick="toggleSkillExpand(\'' + context + '\',\'' + esc(skill) + '\')">' +
       '<span class="fav-star ' + (fav?'on':'') + '" onclick="event.stopPropagation();toggleFav(\'' + esc(skill) + '\')">' + (fav?'★':'☆') + '</span>' +
       '<span>' + esc(skill) + '</span>' +
       '</button>';
@@ -1570,7 +1519,7 @@ function renderSkillButton(skill, context) {
   for (let i = 0; i < cap && i < 7; i++) {
     dots += '<span class="dot ' + (i < curLv ? 'on' : '') + '"></span>';
   }
-  return '<button class="skill-btn ' + (selected?'selected':'') + '" onclick="toggleSkillExpand(\'' + context + '\',\'' + esc(skill) + '\')">' +
+  return '<button class="skill-btn ' + (selected?'selected':'') + '" data-skill="' + esc(skill) + '" data-ctx="' + context + '" onclick="toggleSkillExpand(\'' + context + '\',\'' + esc(skill) + '\')">' +
     '<span class="fav-star ' + (fav?'on':'') + '" onclick="event.stopPropagation();toggleFav(\'' + esc(skill) + '\')">' + (fav?'★':'☆') + '</span>' +
     '<span>' + esc(skill) + '</span>' +
     (selected ? '<span class="level-dots">' + dots + '</span>' : '') +
@@ -1614,9 +1563,33 @@ function toggleSkillExpand(context, skill) {
   } else {
     expandedSkill = { context: context, skill: skill };
   }
-  if (context === 'select') renderSkillSelection();
+  if (context === 'select') {
+    // 局部更新展开的等级选择器，避免全量重建163技能（结果区大量DOM时触发整页重排卡顿）
+    const wrapSel = document.getElementById('skill-selection');
+    wrapSel.querySelectorAll('.lvsel-wrap').forEach(w => w.remove());
+    if (expandedSkill) {
+      let btn = null;
+      wrapSel.querySelectorAll('button[data-ctx="select"][data-skill]').forEach(b => {
+        if (b.dataset.skill === expandedSkill.skill) btn = b;
+      });
+      if (btn) btn.insertAdjacentHTML('afterend', '<div class="lvsel-wrap">' + renderLevelSelector(expandedSkill.skill, 'select', selectedSkills[expandedSkill.skill] || 0) + '</div>');
+    }
+  }
   else if (context === 'selected') renderSelectedSkills();
   else if (context === 'extra') renderExtraSkills();
+}
+
+// 局部更新单个技能按钮（原地替换，保持位置不变；并移除其旁已展开的等级选择器）
+function updateSkillButtonLocal(skill, context) {
+  let btn = null;
+  document.querySelectorAll('#skill-selection button[data-ctx="' + context + '"][data-skill]').forEach(b => {
+    if (b.dataset.skill === skill) btn = b;
+  });
+  if (!btn) return;
+  const next = btn.nextElementSibling;
+  if (next && next.classList.contains('lvsel-wrap')) next.remove();
+  btn.insertAdjacentHTML('beforebegin', renderSkillButton(skill, context));
+  btn.remove();
 }
 
 function toggleFav(skill) {
@@ -1633,7 +1606,7 @@ function setSkillLevel(skill, lv, context) {
   selectedSkills[skill] = lv;
   expandedSkill = null;
   saveState();
-  if (context === 'select') { renderSkillSelection(); renderSelectedSkills(); }
+  if (context === 'select') { updateSkillButtonLocal(skill, 'select'); renderSelectedSkills(); }
   else if (context === 'selected') { renderSelectedSkills(); renderSkillSelection(); }
 }
 
@@ -1641,7 +1614,7 @@ function cancelSkill(skill, context) {
   selectedSkills[skill] = 0;
   expandedSkill = null;
   saveState();
-  if (context === 'select') { renderSkillSelection(); renderSelectedSkills(); }
+  if (context === 'select') { updateSkillButtonLocal(skill, 'select'); renderSelectedSkills(); }
   else if (context === 'selected') { renderSelectedSkills(); renderSkillSelection(); }
   else if (context === 'extra') renderExtraSkills();
 }
@@ -1719,15 +1692,9 @@ function removeSkill(skill) {
 function clearSelectedSkills() {
   selectedSkills = {};
   expandedSkill = null;
-  // 同时清空预留孔位（防具孔/武器孔），并重置对应下拉选择框
+  // 同时清空预留孔位（防具孔/武器孔）
   armorReserve = {1: 0, 2: 0, 3: 0};
   weaponReserve = {1: 0, 2: 0, 3: 0};
-  for (const lv of [1, 2, 3]) {
-    const aSel = document.getElementById('res-armor-lv' + lv);
-    if (aSel) aSel.value = '0';
-    const wSel = document.getElementById('res-weapon-lv' + lv);
-    if (wSel) wSel.value = '0';
-  }
   saveState();
   renderSelectedSkills();
   renderSkillSelection();
@@ -2222,20 +2189,8 @@ function loadSkillGroup(idx) {
   selectedComboSkill = g.selectedComboSkill;
   selectedComboLevel = g.selectedComboLevel || 0;
   weaponSlotLevels = (g.weaponSlots && g.weaponSlots.length === 3) ? g.weaponSlots.slice() : [3, 3, 3];
-  if (g.armorReserve) {
-    armorReserve = { ...g.armorReserve };
-    for (const lv of [1, 2, 3]) {
-      const sel = document.getElementById('res-armor-lv' + lv);
-      if (sel) sel.value = armorReserve[lv] || 0;
-    }
-  }
-  if (g.weaponReserve) {
-    weaponReserve = { ...g.weaponReserve };
-    for (const lv of [1, 2, 3]) {
-      const sel = document.getElementById('res-weapon-lv' + lv);
-      if (sel) sel.value = weaponReserve[lv] || 0;
-    }
-  }
+  if (g.armorReserve) armorReserve = { ...g.armorReserve };
+  if (g.weaponReserve) weaponReserve = { ...g.weaponReserve };
   if (g.favSkills) { favSkills = new Set(g.favSkills); }
   if (g.disabledSkills) { disabledSkills = new Set(g.disabledSkills); }
   renderAll();
@@ -3263,8 +3218,6 @@ function setReserveSlot(side, lv, val) {
   max = Math.min(max, 6);
   const cur = (side === 'armor' ? armorReserve[lv] : weaponReserve[lv]) || 0;
   const newVal = (val === cur) ? 0 : Math.max(0, Math.min(val, max));
-  const sel = document.getElementById('res-' + side + '-lv' + lv);
-  if (sel) sel.value = String(newVal);
   if (side === 'armor') armorReserve[lv] = newVal;
   else weaponReserve[lv] = newVal;
   updateReserveSlots();

@@ -182,16 +182,23 @@ def _plan_result_to_dict(best, plan_cfg, t_used, attempts, verified, sch_t, requ
             'skills': {k: v for k, v in p.get('skills', {}).items() if v > 0}
         })
     charm_info = None
-    if charms:
-        c = charms[0]
-        charm_info = {
-            'name': c['name'],
-            'skills': {k: v for k, v in c.get('skills', {}).items() if v > 0},
-            'armor_slots': list(c.get('slots', [])),
-            'weapon_slots': list(c.get('weapon_slots', []))
-        }
+    weapon_info = None
+    for c in charms:
+        if c.get('part_idx', 5) == 5:
+            charm_info = {
+                'name': c['name'],
+                'skills': {k: v for k, v in c.get('skills', {}).items() if v > 0},
+                'armor_slots': list(c.get('slots', [])),
+                'weapon_slots': list(c.get('weapon_slots', []))
+            }
+        elif c.get('part_idx', 5) == 6:
+            weapon_info = {
+                'name': c['name'],
+                'skills': {k: v for k, v in c.get('skills', {}).items() if v > 0},
+                'weapon_slots': list(c.get('weapon_slots', []))
+            }
 
-    # 系列技能验证（统计防具+护石件数）
+    # 系列技能验证（统计防具+护石+武器件数）
     series_actual = {}
     for p in armors:
         for sk_name in p.get('skills', {}):
@@ -201,8 +208,21 @@ def _plan_result_to_dict(best, plan_cfg, t_used, attempts, verified, sch_t, requ
         for sk_name in charm_info['skills']:
             if sk_name in fs.NO_DECO_SK:
                 series_actual[sk_name] = series_actual.get(sk_name, 0) + 1
+    # 武器部位的系列技能也计入
+    for p in best['pieces']:
+        if p.get('part_idx', 5) == 6:
+            for sk_name in p.get('skills', {}):
+                if sk_name in fs.NO_DECO_SK:
+                    series_actual[sk_name] = series_actual.get(sk_name, 0) + 1
     series_check = []
     sk = {k: v for k, v in best['skills'].items() if v > 0}
+    # 从实际pieces中提取武器提供的系列/组合技能（不依赖plan_cfg）
+    actual_weapon_skills = {}
+    for p in best.get('pieces', []):
+        if p.get('part_idx', 5) == 6:
+            for sk_name, lv in p.get('skills', {}).items():
+                if sk_name in fs.NO_DECO_SK and lv > 0:
+                    actual_weapon_skills[sk_name] = lv
     for k, v in sk.items():
         if k in fs.NO_DECO_SK:
             cap = fs.SKILL_CAPS.get(k, 1)
@@ -212,7 +232,7 @@ def _plan_result_to_dict(best, plan_cfg, t_used, attempts, verified, sch_t, requ
             else:
                 user_lv = cap
             need_p = max(1, user_lv)
-            wprov = 1 if (weapon_sk and k in weapon_sk) else 0
+            wprov = actual_weapon_skills.get(k, 0)
             actual_p = series_actual.get(k, 0) + wprov
             display_level = min(actual_p, cap)
             series_check.append({
@@ -270,6 +290,7 @@ def _plan_result_to_dict(best, plan_cfg, t_used, attempts, verified, sch_t, requ
         },
         'armors': armor_list,
         'charm': charm_info,
+        'weapon': weapon_info,
         'weapon_skill': weapon_skill_info,
         'series_check': series_check,
         'decorations': deco_counts,
@@ -510,11 +531,17 @@ class SearchHandler(BaseHTTPRequestHandler):
         # 追加查询与查询方案保持同一假设，避免"查询无解但追加误报有空间"的矛盾。
         weapon_series = params.get('weapon_series_skill', '')
         weapon_combo = params.get('weapon_combo_skill', '')
-        user_weapon_skills = {}
+        # 与普通搜索一致：武器实际带的技能（用于搜索）
+        weapon_actual_skills = {}
         if weapon_series and weapon_series in fs.NO_DECO_SK:
-            user_weapon_skills[weapon_series] = 1
+            weapon_actual_skills[weapon_series] = 1
         if weapon_combo and weapon_combo in fs.NO_DECO_SK:
-            user_weapon_skills[weapon_combo] = 1
+            weapon_actual_skills[weapon_combo] = 1
+        # auto_weapon=True（自动匹配武器，武器留空）时不传 user_weapon_skills（None），
+        # 让后端自动匹配带 combo 系列技能的武器（保持与查询方案一致），
+        # 否则传空 dict {} 会导致 combo 的系列技能无武器提供、基线无解、追加报无解。
+        auto_weapon = params.get('auto_weapon_skill', True)
+        user_weapon_skills = None if (auto_weapon and not weapon_actual_skills) else weapon_actual_skills
 
         orig_wslots = self._apply_weapon_slots(params)
         t0 = time.time()
@@ -537,6 +564,15 @@ class SearchHandler(BaseHTTPRequestHandler):
 
         with _lock:
             try:
+                # 追加模式多进程并行：按 CPU 核数启用 worker，利用多核弥补 Python 慢。
+                # 全局开关可被外部覆盖；默认 min(cpu_count, 8)（避免 spawn 开销过大的极端核数）。
+                try:
+                    import multiprocessing as _mpc
+                    _default_workers = max(1, min(_mpc.cpu_count() or 2, 8))
+                except Exception:
+                    _default_workers = 2
+                if getattr(fs, 'EXTRA_PARALLEL_WORKERS', 0) == 0:
+                    fs.EXTRA_PARALLEL_WORKERS = _default_workers
                 for chunk in fs.query_extra_stream(
                     fixed_skills, combo_skills, min_rem_armor, fs.charm_pool,
                     mode=mode, fav_skills=fav_skills, dis_skills=dis_skills,
@@ -595,27 +631,17 @@ class SearchHandler(BaseHTTPRequestHandler):
 
         orig_wslots = self._apply_weapon_slots(params)
         t0 = time.time()
-        auto_matched_series = None  # skill name or None
-        auto_matched_group = None   # skill name or None
         with _lock:
             try:
-                # auto 模式（含固定技能=预筛选武器）：dfs_search_auto_weapon 内部
-                # 按固定/留空拆分武器池——固定技能只组合带该技能的武器，
-                # 留空才枚举全部需求相关组合，固定两个时直接搜索（最少组合，最快）。
-                if auto_weapon:
-                    raw_results, auto_matched_series, auto_matched_group = fs.dfs_search_auto_weapon(
-                        fs.charm_pool, fixed_skills, search_combo, min_rem_armor,
-                        max_results=max_results, timeout_s=timeout_s, quiet=False,
-                        disabled_weapon_skills=disabled_ws, min_rem_weapon=min_rem_weapon,
-                        user_weapon_skills=weapon_actual_skills
-                    )
-                else:
-                    # 禁用模式：武器不带任何洗练技能
-                    raw_results = fs.dfs_search(
-                        fs.charm_pool, fixed_skills, search_combo, min_rem_armor,
-                        max_results=max_results, timeout_s=timeout_s, quiet=False,
-                        min_rem_weapon=min_rem_weapon, user_weapon_skills=weapon_actual_skills
-                    )
+                # 统一搜索：武器作为第7个部位平权参与，不再有独立搜索路径
+                # auto_weapon=True（自动匹配武器）时不传 user_weapon_skills（None），
+                # 让后端自动匹配带系列技能的武器；否则（用户固定武器系列）传实际武器技能。
+                user_weapon_skills = None if (auto_weapon and not weapon_actual_skills) else weapon_actual_skills
+                raw_results = fs.dfs_search(
+                    fs.charm_pool, fixed_skills, search_combo, min_rem_armor,
+                    max_results=max_results, timeout_s=timeout_s, quiet=False,
+                    min_rem_weapon=min_rem_weapon, user_weapon_skills=user_weapon_skills
+                )
             except Exception as e:
                 fs.WSLOTS = orig_wslots
                 self._send_json({'error': f'搜索出错: {e}'}, 500)
@@ -623,35 +649,35 @@ class SearchHandler(BaseHTTPRequestHandler):
         fs.WSLOTS = orig_wslots
         t_used = time.time() - t0
         results = []
-        # auto 分支实际搜索时武器提供了自动匹配出的系列/组合件数（各1件），
-        # 但这些信息不在 weapon_actual_skills 里。每个方案独立选择武器（平权），
-        # 因此用方案自身的 _auto_weapon_* 标记构造展示用武器技能，
-        # 否则 _plan_result_to_dict 的 series_check 会漏算武器件数，
-        # 导致已达标(武器补齐)的系列在方案卡里被误标为"未激活"。
         for r in raw_results[:max_results]:
+            # 从方案 pieces 中提取实际使用的武器技能（part_idx=6）
             r_weapon_skills = dict(weapon_actual_skills)
-            if r.get('_auto_weapon_series'):
-                r_weapon_skills[r['_auto_weapon_series']] = 1
-            if r.get('_auto_weapon_group'):
-                r_weapon_skills[r['_auto_weapon_group']] = 1
+            for p in r.get('pieces', []):
+                if p.get('part_idx') == 6:
+                    for sk, lv in p.get('skills', {}).items():
+                        r_weapon_skills[sk] = lv
             fake_cfg = ('自定义搜索', r_weapon_skills, {})
             plan_result = _plan_result_to_dict(r, fake_cfg, t_used, 1, len(raw_results), t_used, requirement_skills=requirement_skills)
             results.append(plan_result)
 
-        # 构造返回的武器技能信息
+        # 构造返回的武器技能信息（从结果中提取）
         auto_weapon_info = {}
-        if auto_matched_series:
-            auto_weapon_info['series_skill'] = auto_matched_series
-            auto_weapon_info['series_level'] = fs.SKILL_CAPS.get(auto_matched_series, 2)
-        if auto_matched_group:
-            auto_weapon_info['group_skill'] = auto_matched_group
-            auto_weapon_info['group_level'] = fs.SKILL_CAPS.get(auto_matched_group, 3)
+        if results:
+            top_weapon_skills = {k: v for k, v in results[0].get('weapon_skills', {}).items() 
+                                 if k in fs.NO_DECO_SK}
+            for sk, lv in top_weapon_skills.items():
+                if sk in fs.SERIES_SK:
+                    auto_weapon_info['series_skill'] = sk
+                    auto_weapon_info['series_level'] = fs.SKILL_CAPS.get(sk, 2)
+                elif sk in fs.GROUP_SK:
+                    auto_weapon_info['group_skill'] = sk
+                    auto_weapon_info['group_level'] = fs.SKILL_CAPS.get(sk, 3)
 
         self._send_json({
             'count': len(results),
             'total_time': round(t_used, 2),
             'fixed_skills': fixed_skills,
-            'combo_skills': combo_skills,
+            'combo_skills': search_combo,
             'auto_weapon': auto_weapon_info if auto_weapon_info else None,
             'results': results
         })
