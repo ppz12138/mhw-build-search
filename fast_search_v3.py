@@ -1116,10 +1116,12 @@ def _build_candidates(charm_pool, fixed_skills, combo_skills, quiet=False, extra
                           for s, v in a_sk.items() if s in all_skill_names)
             slot_sum = sum(a['slots']) if a['slots'] else 0
             score = sk_score + slot_sum
+            _slot_dist = tuple(sorted(a['slots'], reverse=True)) if a['slots'] else ()
             candidates.append({
                 'name': a['name'], 'part_idx': pi,
                 'skills': a_sk, 'slots': a['slots'],
                 'slots_sorted': tuple(sorted(a['slots'], reverse=True)),
+                '_slot_dist': _slot_dist,
                 'wslots_sorted': (),
                 'rarity': a['rarity'], 'score': score,
                 'max_slot': max(a['slots']) if a['slots'] else 0,
@@ -1135,25 +1137,27 @@ def _build_candidates(charm_pool, fixed_skills, combo_skills, quiet=False, extra
         sk_score = sum(min(v, merged_needs.get(s, 0)) * SKILL_WEIGHT
                       for s, v in c_sk.items() if s in all_skill_names)
         score = sk_score + a_sum + w_sum
+        _as_dist = tuple(sorted(armor_slots, reverse=True)) if armor_slots else ()
+        _ws_dist = tuple(sorted(weapon_slots, reverse=True)) if weapon_slots else ()
         candidates.append({
             'name': c['name'], 'part_idx': 5,
             'skills': c_sk, 'slots': armor_slots,
             'slots_sorted': tuple(sorted(armor_slots, reverse=True)),
             'weapon_slots': weapon_slots,
             'wslots_sorted': tuple(sorted(weapon_slots, reverse=True)),
+            '_slot_dist': (_as_dist, _ws_dist),
             'rarity': 0, 'score': score,
             'max_slot': max(armor_slots + weapon_slots) if (armor_slots or weapon_slots) else 0,
             'slot_sum': a_sum, 'w_slot_sum': w_sum
         })
 
     # 武器候选池（平权处理，统一进入候选构建）
-    # 固定武器过滤：GUI 语义"固定=预筛选武器"——用户显式指定武器技能时
-    # （user_weapon_skills 非 None），只保留"包含全部指定技能"的武器进入匹配池
-    # （如指定 黑蚀龙之力+霸主之魂 → 只剩 武器[黑蚀龙之力 + 霸主之魂] 一个候选）。
-    # 注意仅在用户显式指定时过滤：旧路径（None）从 combo_skills 提取的系列技能
-    # 可由防具提供，据此裁剪武器池会误删合法解（旧行为保持不变）。
+    # 武器过滤：仅保留包含所需 NO_DECO_SK（combo_skills 中的系列/组合技能）的武器
+    # 当 user_weapon_skills 非 None 时按用户指定的武器技能精确过滤；
+    # 否则自动从 combo_skills 提取 NO_DECO_SK 作为过滤条件，避免武器池膨胀导致
+    # 追加查询 DFS 超时（如满足感 Lv3 搜索时候选从 238 膨胀到 653）。
     _fixed_weapon_filter = None
-    if user_weapon_skills is not None and weapon_skills:
+    if weapon_skills:
         _fixed_weapon_filter = [(s, lv) for s, lv in weapon_skills.items()]
     for c in weapon_pool:
         c_sk = dict(c.get('skills', {}))
@@ -1169,12 +1173,15 @@ def _build_candidates(charm_pool, fixed_skills, combo_skills, quiet=False, extra
         sk_score = sum(min(v, merged_needs.get(s, 0)) * SKILL_WEIGHT
                       for s, v in c_sk.items() if s in all_skill_names)
         score = sk_score + a_sum + w_sum
+        _as_dist = tuple(sorted(armor_slots, reverse=True)) if armor_slots else ()
+        _ws_dist = tuple(sorted(weapon_slots, reverse=True)) if weapon_slots else ()
         candidates.append({
             'name': c['name'], 'part_idx': 6,
             'skills': c_sk, 'slots': armor_slots,
             'slots_sorted': tuple(sorted(armor_slots, reverse=True)),
             'weapon_slots': weapon_slots,
             'wslots_sorted': tuple(sorted(weapon_slots, reverse=True)),
+            '_slot_dist': (_as_dist, _ws_dist),
             'rarity': c.get('rarity', 0), 'score': score,
             'max_slot': max(armor_slots + weapon_slots) if (armor_slots or weapon_slots) else 0,
             'slot_sum': a_sum, 'w_slot_sum': w_sum
@@ -1194,6 +1201,7 @@ def _build_candidates(charm_pool, fixed_skills, combo_skills, quiet=False, extra
                 merged[key]['max_slot'] = c['max_slot']
                 merged[key]['slot_sum'] = c['slot_sum']
                 merged[key]['w_slot_sum'] = c['w_slot_sum']
+                merged[key]['_slot_dist'] = c.get('_slot_dist', ())
         else:
             merged[key] = {
                 'name': c['name'], 'names': [c['name']],
@@ -1201,6 +1209,7 @@ def _build_candidates(charm_pool, fixed_skills, combo_skills, quiet=False, extra
                 'slots': c['slots'], 'weapon_slots': c.get('weapon_slots', []),
                 'slots_sorted': c.get('slots_sorted', ()),
                 'wslots_sorted': c.get('wslots_sorted', ()),
+                '_slot_dist': c.get('_slot_dist', ()),
                 'rarity': c['rarity'], 'score': c['score'],
                 'max_slot': c['max_slot'],
                 'slot_sum': c['slot_sum'], 'w_slot_sum': c['w_slot_sum'],
@@ -1233,7 +1242,11 @@ def _build_candidates(charm_pool, fixed_skills, combo_skills, quiet=False, extra
             if _s in NO_DECO_SK:
                 protection_skills.setdefault(_s, 0)
         if extra_skill_names:
+            # 追加模式：额外保护追加目标技能，保留 NO_DECO_SK 兜底逻辑
             protection_skills = dict(merged_needs)
+            for _s in merged_needs:
+                if _s in NO_DECO_SK:
+                    protection_skills.setdefault(_s, 0)
             for _s in extra_skill_names:
                 protection_skills.setdefault(_s, 0)
         # 注：不再用 protect_no_deco 把所有候选的 NO_DECO 技能塞进 protection_skills。
@@ -1271,9 +1284,11 @@ def _build_candidates(charm_pool, fixed_skills, combo_skills, quiet=False, extra
                 for _sc, _items in _score_grp.items():
                     _equiv = {}
                     for it in _items:
-                        # 对齐网页版 Od：仅比"槽位总数(j)"与"需求技能贡献"，
-                        # 不比槽位数组（槽位[3,1,0]与[2,2,1]总数相同视为等价）。
-                        _k = (it['slot_sum'], it['w_slot_sum'],
+                        # 对齐网页版 Od：比"槽位数组(_slot_dist)"与"需求技能贡献"。
+                        # 孔位分布 [3,1,0] 与 [2,2,0] 不可视为等价，
+                        # 因为不同等级珠需要不同等级孔，槽位等级分布直接影响可达性。
+                        _sd = it.get('_slot_dist', ())
+                        _k = (_sd,
                               tuple(it['skills'].get(sk, 0) for sk in protection_skills))
                         if _k in _equiv:
                             _equiv[_k]['names'].append(it['name'])
@@ -3496,7 +3511,6 @@ def query_extra_stream(fixed_skills, combo_skills, min_rem_armor, charm_pool, mo
                     _u_build_fixed = dict(fixed_skills)
                     _u_build_fixed[sk] = cap
                     _u_ctx = _build_candidates(charm_pool, _u_build_fixed, combo_skills, quiet=True,
-                                               extra_skill_names={sk},
                                                user_weapon_skills=user_weapon_skills,
                                                protect_no_deco=True)
                     for lv in range(cur_lv + 1, cap + 1):
@@ -3525,8 +3539,9 @@ def query_extra_stream(fixed_skills, combo_skills, min_rem_armor, charm_pool, mo
                 # 升序单调搜索：专属候选池（目标技能参与评分/保护），首次失败即停
                 _u_build_fixed = dict(fixed_skills)
                 _u_build_fixed[sk] = cap
+                # 注意：不再传 extra_skill_names={sk}——目标技能已在 _u_build_fixed 中，
+                # extra_skill_names 会导致候选池膨胀（396 vs 238），破坏搜索正确性。
                 _u_ctx = _build_candidates(charm_pool, _u_build_fixed, combo_skills, quiet=True,
-                                           extra_skill_names={sk},
                                            user_weapon_skills=user_weapon_skills)
                 for lv in range(cur_lv + 1, cap + 1):
                     test_fixed = dict(fixed_skills)
@@ -3581,7 +3596,6 @@ def query_extra_stream(fixed_skills, combo_skills, min_rem_armor, charm_pool, mo
                 _s_build_fixed = dict(fixed_skills)
                 _s_build_fixed[sk] = actual_cap
                 _s_ctx = _build_candidates(charm_pool, _s_build_fixed, combo_skills, quiet=True,
-                                           extra_skill_names={sk},
                                            user_weapon_skills=user_weapon_skills,
                                            protect_no_deco=True)
                 for lv in range(base_lv + 1, actual_cap + 1):
@@ -3692,7 +3706,6 @@ def query_extra_stream(fixed_skills, combo_skills, min_rem_armor, charm_pool, mo
             _build_fixed = dict(fixed_skills)
             _build_fixed[sk] = start_lv
             _ctx = _build_candidates(charm_pool, _build_fixed, combo_skills, quiet=True,
-                                     extra_skill_names={sk},
                                      user_weapon_skills=user_weapon_skills,
                                      protect_no_deco=(sk in NO_DECO_SK))
 
@@ -3946,7 +3959,6 @@ def _run_single_skill(ctx, job):
                 _u_build_fixed = dict(fixed_skills)
                 _u_build_fixed[sk] = cap
                 _u_ctx = _build_candidates(charm_pool, _u_build_fixed, combo_skills, quiet=True,
-                                           extra_skill_names={sk},
                                            user_weapon_skills=user_weapon_skills,
                                            protect_no_deco=True)
                 for lv in range(cur_lv + 1, cap + 1):
@@ -3971,7 +3983,6 @@ def _run_single_skill(ctx, job):
             _u_build_fixed = dict(fixed_skills)
             _u_build_fixed[sk] = cap
             _u_ctx = _build_candidates(charm_pool, _u_build_fixed, combo_skills, quiet=True,
-                                       extra_skill_names={sk},
                                        user_weapon_skills=user_weapon_skills)
             for lv in range(cur_lv + 1, cap + 1):
                 test_fixed = dict(fixed_skills)
@@ -4018,7 +4029,6 @@ def _run_single_skill(ctx, job):
             _s_build_fixed = dict(fixed_skills)
             _s_build_fixed[sk] = actual_cap
             _s_ctx = _build_candidates(charm_pool, _s_build_fixed, combo_skills, quiet=True,
-                                       extra_skill_names={sk},
                                        user_weapon_skills=user_weapon_skills,
                                        protect_no_deco=True)
             for lv in range(base_lv + 1, actual_cap + 1):
@@ -4114,7 +4124,6 @@ def _run_single_skill(ctx, job):
         _build_fixed = dict(fixed_skills)
         _build_fixed[sk] = start_lv
         _ctx = _build_candidates(charm_pool, _build_fixed, combo_skills, quiet=True,
-                                 extra_skill_names={sk},
                                  user_weapon_skills=user_weapon_skills,
                                  protect_no_deco=(sk in NO_DECO_SK))
 
